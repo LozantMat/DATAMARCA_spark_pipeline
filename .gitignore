@@ -1,0 +1,17 @@
+# Generated data (reproducible with data_generator.py)
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+checkpoints/
+
+.DS_Store
