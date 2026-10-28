@@ -224,6 +224,232 @@ def _build_stores() -> dict[str, list[dict]]:
 
 STORES = _build_stores()
 
+COUNTRY_NAMES = {"CO": "Colombia", "MX": "México", "PE": "Perú"}
+PERISHABLE_CATEGORIES = {"FRUVER", "CARNES", "LACTEOS", "PANADERIA"}
+
+
+# --------------------------------------------------------------------------- #
+# Dimension tables (reference data for the pipeline joins)
+# --------------------------------------------------------------------------- #
+
+DIM_FIELDS = {
+    "dim_countries": ["country_code", "country_name", "currency", "fx_per_usd",
+                      "tax_rate", "utc_offset", "pos_system"],
+    "dim_stores": ["store_id", "country_code", "city_code", "city",
+                   "warehouse_id"],
+    "dim_products": ["sku", "product_name", "category", "unit_of_measure",
+                     "base_price_usd", "is_perishable"],
+}
+
+
+def build_dimensions() -> dict[str, list[dict]]:
+    """Static master data the generator already uses internally, exposed as
+    tables so the pipeline can join facts with stores, products and FX rates
+    (e.g. to normalise COP/MXN/PEN amounts to USD)."""
+    countries = [{
+        "country_code": cc, "country_name": COUNTRY_NAMES[cc],
+        "currency": cfg["currency"], "fx_per_usd": cfg["fx_per_usd"],
+        "tax_rate": cfg["tax_rate"], "utc_offset": cfg["utc_offset"],
+        "pos_system": cfg["pos_system"],
+    } for cc, cfg in COUNTRIES.items()]
+
+    stores = [{
+        "store_id": s["store_id"], "country_code": cc,
+        "city_code": s["store_id"].split("-")[1], "city": s["city"],
+        "warehouse_id": s["warehouse_id"],
+    } for cc, rows in STORES.items() for s in rows]
+
+    products = [{
+        "sku": sku, "product_name": name, "category": cat,
+        "unit_of_measure": uom, "base_price_usd": usd,
+        "is_perishable": cat in PERISHABLE_CATEGORIES,
+    } for sku, name, cat, uom, usd in CATALOG]
+
+    return {"dim_countries": countries, "dim_stores": stores,
+            "dim_products": products}
+
+
+def write_dimensions(out_dir: Path | str = DATA_DIR / "dims") -> Path:
+    """Write one CSV per dimension table into ``out_dir``.
+
+    The tables are static (they do not depend on the seed), so they are
+    rewritten on every run and always match the facts.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, rows in build_dimensions().items():
+        target = out_dir / f"{name}.csv"
+        tmp = target.with_name(f".{target.name}.tmp")
+        with tmp.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=DIM_FIELDS[name])
+            writer.writeheader()
+            for row in rows:  # lowercase booleans so Spark infers BooleanType
+                writer.writerow({k: str(v).lower() if isinstance(v, bool) else v
+                                 for k, v in row.items()})
+        os.replace(tmp, target)
+    return out_dir
+
+
+# --------------------------------------------------------------------------- #
+# Data contract (expected schemas + quality rules the pipeline must enforce)
+# --------------------------------------------------------------------------- #
+
+_TIME_SCHEMA = {
+    "event_ts_utc": "TIMESTAMP", "event_ts_local": "STRING",
+    "emitted_ts_utc": "TIMESTAMP", "event_date": "DATE", "event_hour": "INT",
+    "batch_id": "STRING", "schema_version": "STRING",
+}
+
+_ITEM_SCHEMA = {
+    "sku": "STRING", "product_name": "STRING", "category": "STRING",
+    "unit_of_measure": "STRING", "quantity": "DOUBLE", "unit_price": "DOUBLE",
+    "discount_amount": "DOUBLE", "tax_amount": "DOUBLE", "line_total": "DOUBLE",
+}
+
+# Nested dict = STRUCT, one-element list = ARRAY of that element.
+SCHEMAS: dict[str, dict] = {
+    "POS": {
+        "transaction_id": "STRING", "line_number": "INT",
+        "source_channel": "STRING", "source_system": "STRING",
+        "country_code": "STRING", "city": "STRING", "store_id": "STRING",
+        "warehouse_id": "STRING", "terminal_id": "STRING",
+        "cashier_id": "STRING", "customer_id": "STRING", "loyalty_id": "STRING",
+        **_ITEM_SCHEMA,
+        "currency": "STRING", "payment_method": "STRING",
+        **_TIME_SCHEMA,
+    },
+    "ECOMMERCE": {
+        "event_id": "STRING", "event_type": "STRING", "order_id": "STRING",
+        "source_channel": "STRING", "source_system": "STRING",
+        "country_code": "STRING", "session_id": "STRING",
+        "customer": {"customer_id": "STRING", "loyalty_id": "STRING"},
+        "device": {"platform": "STRING", "app_version": "STRING"},
+        "fulfillment": {"delivery_type": "STRING", "store_id": "STRING",
+                        "warehouse_id": "STRING", "city": "STRING"},
+        "items": [_ITEM_SCHEMA],
+        "payment": {"method": "STRING", "currency": "STRING",
+                    "discount_total": "DOUBLE", "tax_total": "DOUBLE",
+                    "total": "DOUBLE"},
+        **_TIME_SCHEMA,
+    },
+    "LOYALTY_APP": {
+        "event_id": "STRING", "event_type": "STRING",
+        "transaction_id": "STRING", "source_channel": "STRING",
+        "source_system": "STRING", "country_code": "STRING",
+        "member": {"loyalty_id": "STRING", "customer_id": "STRING",
+                   "tier": "STRING"},
+        "store_id": "STRING", "city": "STRING", "app_version": "STRING",
+        "items": [_ITEM_SCHEMA],
+        "amount": {"currency": "STRING", "total": "DOUBLE",
+                   "tax_total": "DOUBLE", "discount_total": "DOUBLE"},
+        "points": {"earned": "INT", "redeemed": "INT"},
+        "payment_method": "STRING",
+        **_TIME_SCHEMA,
+    },
+}
+# POS columns must follow the CSV header order
+SCHEMAS["POS"] = {f: SCHEMAS["POS"][f] for f in POS_FIELDS}
+
+# Business key per channel (used for deduplication)
+DEDUP_KEYS = {
+    "POS": ["transaction_id", "line_number"],
+    "ECOMMERCE": ["order_id"],
+    "LOYALTY_APP": ["transaction_id"],
+}
+
+# Each rule names the injected defect it is meant to catch ("detects") and
+# what the pipeline should do with the offending record ("action").
+# Rules are evaluated in order and a record is tagged with the FIRST rule it
+# fails (e.g. a negative quantity also breaks DQ05, but it is reported as DQ04).
+QUALITY_RULES = [
+    {"id": "DQ01", "name": "parseable_record", "channels": list(CHANNELS),
+     "check": "record parses with the expected schema "
+              "(CSV: all columns present; JSON: valid object)",
+     "detects": "malformed", "action": "quarantine"},
+    {"id": "DQ02", "name": "required_fields", "channels": list(CHANNELS),
+     "check": "not null / not empty",
+     "fields": {
+         "POS": ["transaction_id", "store_id", "warehouse_id", "sku",
+                 "quantity", "unit_price", "line_total", "event_ts_utc"],
+         "ECOMMERCE": ["order_id", "fulfillment.store_id",
+                       "fulfillment.warehouse_id", "items", "event_ts_utc"],
+         "LOYALTY_APP": ["transaction_id", "store_id", "member.loyalty_id",
+                         "items", "event_ts_utc"],
+     },
+     "note": "country_code is validated by DQ03 (an empty code is invalid)",
+     "detects": "missing_required", "action": "quarantine"},
+    {"id": "DQ03", "name": "valid_country", "channels": list(CHANNELS),
+     "check": "country_code IN ('CO', 'MX', 'PE')",
+     "detects": "invalid_country", "action": "quarantine"},
+    {"id": "DQ04", "name": "positive_quantity", "channels": list(CHANNELS),
+     "check": "quantity > 0 (every line / every item)",
+     "detects": "negative_quantity", "action": "quarantine"},
+    {"id": "DQ05", "name": "line_amount_consistency", "channels": list(CHANNELS),
+     "check": "abs(line_total - (quantity * unit_price - discount_amount)) <= 0.02",
+     "tolerance": 0.02,
+     "detects": "amount_mismatch", "action": "quarantine"},
+    {"id": "DQ06", "name": "event_not_in_future", "channels": list(CHANNELS),
+     "check": "event_ts_utc <= emitted_ts_utc + 5 minutes (clock-skew margin)",
+     "detects": "future_event_ts", "action": "quarantine"},
+    {"id": "DQ07", "name": "unique_business_key", "channels": list(CHANNELS),
+     "check": "one record per business key; keep the earliest emitted_ts_utc",
+     "keys": DEDUP_KEYS,
+     "detects": "duplicate", "action": "drop_duplicate"},
+    {"id": "DQ08", "name": "currency_matches_country", "channels": list(CHANNELS),
+     "check": "currency = dim_countries.currency for the country_code",
+     "detects": None, "action": "flag",
+     "note": "no defect is injected for this rule; 0 violations expected"},
+    {"id": "DQ09", "name": "referential_integrity", "channels": list(CHANNELS),
+     "check": "store_id IN dim_stores AND sku IN dim_products",
+     "detects": None, "action": "flag",
+     "note": "no defect is injected for this rule; 0 violations expected"},
+]
+
+# Late data is not an error: it is handled with watermarks, not quarantined.
+LATE_DATA_POLICY = {
+    "definition": "emitted_ts_utc - event_ts_utc > 60 seconds",
+    "max_expected_delay_minutes": 15,
+    "suggested_watermark": "20 minutes on event_ts_utc",
+}
+
+
+def _ddl_type(t) -> str:
+    if isinstance(t, dict):
+        return "STRUCT<" + ", ".join(f"{k}: {_ddl_type(v)}" for k, v in t.items()) + ">"
+    if isinstance(t, list):
+        return f"ARRAY<{_ddl_type(t[0])}>"
+    return t
+
+
+def spark_ddl(channel: str) -> str:
+    """Spark DDL schema string for a channel, ready for
+    ``spark.read.schema(spark_ddl("POS")).csv(...)``."""
+    return ", ".join(f"{k} {_ddl_type(v)}" for k, v in SCHEMAS[channel].items())
+
+
+def build_contract() -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "channels": {ch: {"format": CHANNEL_EXT[ch],
+                          "folder": CHANNEL_DIRS[ch],
+                          "dedup_key": DEDUP_KEYS[ch],
+                          "spark_ddl": spark_ddl(ch),
+                          "schema": SCHEMAS[ch]} for ch in CHANNELS},
+        "quality_rules_evaluation": "in order; a record is tagged with the "
+                                    "first rule it fails",
+        "quality_rules": QUALITY_RULES,
+        "late_data_policy": LATE_DATA_POLICY,
+        "partitioning": ["country_code", "event_date"],
+    }
+
+
+def write_contract(target: Path | str) -> Path:
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(build_contract(), indent=2, ensure_ascii=False),
+                      encoding="utf-8")
+    return target
+
 
 # --------------------------------------------------------------------------- #
 # Engine
@@ -244,6 +470,8 @@ class Window:
     # Records (by channel/position) that must be corrupted when written to disk
     malformed: dict[str, set[int]] = field(
         default_factory=lambda: {ch: set() for ch in CHANNELS})
+    # Ground truth: one entry per late or defective transaction in this window
+    truth: list[dict] = field(default_factory=list)
 
     @property
     def total_transactions(self) -> int:
@@ -271,6 +499,7 @@ class _Emission:
     defect: str | None = field(compare=False)
     late: bool = field(compare=False)
     is_duplicate: bool = field(compare=False, default=False)
+    tx_id: str = field(compare=False, default="")
 
 
 class DataGenerator:
@@ -320,11 +549,15 @@ class DataGenerator:
         """Write one file per channel per simulated minute.
 
         Layout: ``<out_dir>/<channel>/ingest_date=YYYY-MM-DD/<channel>_YYYYmmdd_HHMM.<ext>``
+        plus ``_manifest.jsonl``, ``_truth.jsonl``, ``_contract.json`` and
+        ``_run.json`` (files starting with ``_`` are ignored by Spark readers).
         """
         out_dir = Path(out_dir)
         _prepare_dir(out_dir, clean)
-        manifest_path = out_dir / "_manifest.jsonl"
-        with manifest_path.open("w", encoding="utf-8") as manifest:
+        write_contract(out_dir / "_contract.json")
+        stats = _RunStats("batch", self, out_dir)
+        with (out_dir / "_manifest.jsonl").open("w", encoding="utf-8") as manifest, \
+                (out_dir / "_truth.jsonl").open("w", encoding="utf-8") as truth:
             for window in self.iter_batches():
                 stamp = f"{window.start:%Y%m%d_%H%M}"
                 for ch in CHANNELS:
@@ -336,8 +569,11 @@ class DataGenerator:
                     _write_records(target, ch, window.records[ch],
                                    window.malformed[ch])
                 manifest.write(json.dumps(window.manifest()) + "\n")
+                truth.writelines(json.dumps(t) + "\n" for t in window.truth)
+                stats.add(window)
                 if verbose:
                     _log(window)
+        stats.finish()
         return out_dir
 
     def write_stream(self, out_dir: Path | str = DATA_DIR / "stream",
@@ -353,9 +589,12 @@ class DataGenerator:
         """
         out_dir = Path(out_dir)
         _prepare_dir(out_dir, clean)
-        manifest_path = out_dir / "_manifest.jsonl"
+        write_contract(out_dir / "_contract.json")
+        stats = _RunStats("stream", self, out_dir,
+                          interval_seconds=interval_seconds, speed=speed)
         wall_start = time.monotonic()
-        with manifest_path.open("w", encoding="utf-8") as manifest:
+        with (out_dir / "_manifest.jsonl").open("w", encoding="utf-8") as manifest, \
+                (out_dir / "_truth.jsonl").open("w", encoding="utf-8") as truth:
             for window in self.iter_stream(interval_seconds):
                 if speed > 0:
                     due = (window.end - self.start).total_seconds() / speed
@@ -372,8 +611,12 @@ class DataGenerator:
                                    window.malformed[ch])
                 manifest.write(json.dumps(window.manifest()) + "\n")
                 manifest.flush()
+                truth.writelines(json.dumps(t) + "\n" for t in window.truth)
+                truth.flush()
+                stats.add(window)
                 if verbose:
                     _log(window)
+        stats.finish()
         return out_dir
 
     # ---- windowing ------------------------------------------------------- #
@@ -421,8 +664,21 @@ class DataGenerator:
         if em.late:
             window.late += 1
         # A duplicate counts once (on the copy), not on the original
-        if em.defect and (em.defect != "duplicate" or em.is_duplicate):
-            window.defects[em.defect] += 1
+        defect = em.defect if (em.defect != "duplicate" or em.is_duplicate) else None
+        if defect:
+            window.defects[defect] += 1
+        if defect or em.late:
+            first = em.payload[0]
+            window.truth.append({
+                "transaction_id": em.tx_id,
+                "source_channel": em.channel,
+                "batch_id": window.batch_id,
+                "event_ts_utc": first["event_ts_utc"],
+                "emitted_ts_utc": emitted,
+                "defect": defect,
+                "is_late": em.late,
+                "is_duplicate_copy": em.is_duplicate,
+            })
 
     # ---- generation ------------------------------------------------------ #
 
@@ -454,13 +710,15 @@ class DataGenerator:
 
             payload = _FORMATTERS[channel](tx)
             emissions.append(_Emission(emitted, (minute, i, 0), channel,
-                                       payload, defect, late))
+                                       payload, defect, late,
+                                       tx_id=tx["transaction_id"]))
             if defect == "duplicate":
                 # Client/POS retry: same records re-sent seconds later
                 retry_at = emitted + timedelta(seconds=rng.uniform(1, 90))
                 emissions.append(_Emission(retry_at, (minute, i, 1), channel,
                                            copy.deepcopy(payload), defect,
-                                           late, is_duplicate=True))
+                                           late, is_duplicate=True,
+                                           tx_id=tx["transaction_id"]))
         return emissions
 
     def _build_transaction(self, rng: random.Random, channel: str, cc: str,
@@ -613,7 +871,8 @@ def _to_pos(tx: dict) -> list[dict]:
 def _items(tx: dict) -> list[dict]:
     return [{k: line[k] for k in ("sku", "product_name", "category",
                                   "unit_of_measure", "quantity", "unit_price",
-                                  "discount_amount", "line_total")}
+                                  "discount_amount", "tax_amount",
+                                  "line_total")}
             for line in tx["lines"]]
 
 
@@ -712,6 +971,60 @@ def _prepare_dir(out_dir: Path, clean: bool) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
 
+class _RunStats:
+    """Accumulates totals for a run and writes ``_run.json`` at the end.
+    Used as evidence for the volume / performance tests."""
+
+    def __init__(self, mode: str, gen: "DataGenerator", out_dir: Path, **extra):
+        self.mode, self.out_dir = mode, out_dir
+        self.params = {"seed": gen.seed, "start": _fmt_utc(gen.start),
+                       "minutes": gen.minutes, "tx_per_minute": gen.tx_per_minute,
+                       "dirty_rate": gen.dirty_rate,
+                       "late_rate_scale": gen.late_rate_scale, **extra}
+        self.windows = 0
+        self.transactions: Counter = Counter()
+        self.records: Counter = Counter()
+        self.defects: Counter = Counter()
+        self.late = 0
+        self.t0 = time.monotonic()
+
+    def add(self, window: Window) -> None:
+        self.windows += 1
+        self.transactions.update(window.transactions)
+        self.records.update({ch: len(r) for ch, r in window.records.items()})
+        self.defects.update(window.defects)
+        self.late += window.late
+
+    def finish(self) -> dict:
+        elapsed = time.monotonic() - self.t0
+        files = [p for p in self.out_dir.rglob("*")
+                 if p.is_file() and not p.name.startswith(("_", "."))]
+        size = sum(p.stat().st_size for p in files)
+        tx = sum(self.transactions.values())
+        summary = {
+            "mode": self.mode,
+            "generated_at_utc": _fmt_utc(datetime.now(timezone.utc)),
+            "params": self.params,
+            "windows": self.windows,
+            "transactions": tx,
+            "transactions_by_channel": dict(self.transactions),
+            "records_by_channel": dict(self.records),
+            "late_arrivals": self.late,
+            "injected_defects": dict(self.defects),
+            "data_files": len(files),
+            "data_size_mb": round(size / 1_048_576, 2),
+            "elapsed_seconds": round(elapsed, 2),
+            "transactions_per_second": round(tx / elapsed, 1) if elapsed else None,
+        }
+        (self.out_dir / "_run.json").write_text(json.dumps(summary, indent=2),
+                                                 encoding="utf-8")
+        print(f"Summary: {tx} tx, {sum(self.records.values())} records, "
+              f"{self.late} late, {sum(self.defects.values())} defects, "
+              f"{summary['data_files']} files, {summary['data_size_mb']} MB, "
+              f"{summary['elapsed_seconds']} s", flush=True)
+        return summary
+
+
 
 # --------------------------------------------------------------------------- #
 # CLI
@@ -720,6 +1033,8 @@ def _prepare_dir(out_dir: Path, clean: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="DATAMARCA synthetic data generator")
     sub = parser.add_subparsers(dest="mode", required=True)
+    dims = sub.add_parser("dims", help="write only the dimension tables")
+    dims.add_argument("--out", default=str(DATA_DIR / "dims"))
     for name in ("batch", "stream"):
         p = sub.add_parser(name)
         p.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -742,7 +1057,34 @@ def main() -> None:
     sub.choices["stream"].add_argument(
         "--speed", type=float, default=60.0,
         help="simulation speed-up: 1 = real time, 60 = 1 min per second, 0 = no wait")
+    sub.add_parser("contract", help="print the data contract (schemas + rules)")
     args = parser.parse_args()
+
+    if args.mode == "dims":
+        print(f"Done -> {write_dimensions(args.out)}")
+        return
+    if args.mode == "contract":
+        print(json.dumps(build_contract(), indent=2, ensure_ascii=False))
+        return
+
+    # Fail fast on invalid parameters instead of producing odd data
+    try:
+        _parse_utc(args.start)
+    except ValueError:
+        parser.error(f"--start must be ISO-8601 UTC, got {args.start!r}")
+    if args.minutes <= 0:
+        parser.error("--minutes must be > 0")
+    if args.tx_per_minute <= 0:
+        parser.error("--tx-per-minute must be > 0")
+    if not 0 <= args.dirty_rate <= 1:
+        parser.error("--dirty-rate must be between 0 and 1")
+    if args.late_scale < 0:
+        parser.error("--late-scale must be >= 0")
+    if args.mode == "stream" and (args.interval <= 0 or 60 % args.interval):
+        parser.error("--interval must be a positive divisor of 60 (1-6, 10, 12, 15, 20, 30, 60)")
+
+    # Facts and dimensions always travel together: data/dims next to data/batch
+    write_dimensions(Path(args.out).parent / "dims")
 
     gen = DataGenerator(seed=args.seed, start=args.start, minutes=args.minutes,
                         tx_per_minute=args.tx_per_minute,
