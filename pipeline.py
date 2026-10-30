@@ -275,4 +275,8 @@ def parse_args(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(run(parse_args()))
+    exit_code = run(parse_args())
+    # Databricks runs scripts under IPython, where any SystemExit (even 0)
+    # marks the task as failed: only exit explicitly on failure.
+    if exit_code:
+        sys.exit(exit_code)
