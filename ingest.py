@@ -22,12 +22,20 @@ Usage:
     python ingest.py --input data/batch --lake lake
     python ingest.py --input data/batch --lake lake --format delta
     spark-submit ingest.py --input gs://<bucket>/raw/batch --lake gs://<bucket>/lake
+
+Databricks (serverless job / notebook): outputs become Unity Catalog Delta
+tables named <layer>_<name> (e.g. workspace.datamarca.silver_sales_lines);
+reports still go to <lake>/_reports (use a /Volumes/... path as --lake):
+    python ingest.py --input /Volumes/workspace/datamarca/raw/batch \
+        --dims /Volumes/workspace/datamarca/raw/dims \
+        --lake /Volumes/workspace/datamarca/lake --tables workspace.datamarca
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -49,6 +57,50 @@ LATE_THRESHOLD_S = 60             # late-data definition in the contract
 
 ITEM_COLS = ["sku", "product_name", "category", "unit_of_measure", "quantity",
              "unit_price", "discount_amount", "tax_amount", "line_total"]
+
+# --------------------------------------------------------------------------- #
+# Runtime: Databricks serverless vs classic Spark (local / Dataproc)
+# --------------------------------------------------------------------------- #
+
+# Databricks serverless runs on Spark Connect: no sparkContext / JVM access,
+# no DataFrame cache and only a few settable Spark configs. Everything else in
+# the pipeline is identical; these helpers hide the differences.
+ON_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
+DEFAULT_DATABRICKS_TABLES = "workspace.datamarca"
+# Unity Catalog managed tables are Delta; elsewhere tables follow --format
+TABLE_FORMAT: str | None = "delta" if ON_DATABRICKS else None
+_TABLES: str | None = None   # "<catalog>.<schema>" -> write/read tables, not paths
+
+
+def configure_tables(tables: str | None) -> str | None:
+    """Register lake datasets as tables in ``<catalog>.<schema>``.
+    Mandatory on Databricks (Unity Catalog cannot use Volumes as table
+    locations), optional elsewhere."""
+    global _TABLES
+    _TABLES = tables or (DEFAULT_DATABRICKS_TABLES if ON_DATABRICKS else None)
+    return _TABLES
+
+
+def table_name(path: str) -> str:
+    """<lake>/silver/sales_lines -> <catalog>.<schema>.silver_sales_lines"""
+    layer, name = path.rstrip("/").split("/")[-2:]
+    return f"{_TABLES}.{layer}_{name}"
+
+
+def materialize(df: DataFrame) -> DataFrame:
+    """cache() where supported; no-op on Databricks serverless."""
+    return df if ON_DATABRICKS else df.cache()
+
+
+def release(*dfs: DataFrame) -> None:
+    if not ON_DATABRICKS:
+        for df in dfs:
+            df.unpersist()
+
+
+def default_parallelism(spark: SparkSession):
+    return None if ON_DATABRICKS else spark.sparkContext.defaultParallelism
+
 
 # Unified line-level schema shared by the three channels
 UNIFIED_COLS = [
@@ -86,6 +138,17 @@ REQUIRED = {
 
 def build_spark(fmt: str, master: str | None = None,
                 shuffle_partitions: int = 16) -> SparkSession:
+    if ON_DATABRICKS:
+        # The session already exists (Delta built in). Only a few configs can
+        # be set on serverless; an unsupported one would fail the job.
+        spark = SparkSession.builder.getOrCreate()
+        for key, value in (("spark.sql.session.timeZone", "UTC"),
+                           ("spark.sql.shuffle.partitions", str(shuffle_partitions))):
+            try:
+                spark.conf.set(key, value)
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: {key} not settable here ({exc})")
+        return spark
     builder = (SparkSession.builder.appName("datamarca-ingest")
                .config("spark.sql.session.timeZone", "UTC")
                .config("spark.sql.adaptive.enabled", "true")
@@ -123,6 +186,11 @@ def read_text_file(spark: SparkSession, path: str) -> str | None:
     ``_contract.json``), so metadata files are opened directly. Works for
     local paths and for gs:// / s3a:// / abfss:// alike.
     """
+    if "://" not in path:  # local disk or Databricks /Volumes (FUSE mount)
+        local = path[len("dbfs:"):] if path.startswith("dbfs:") else path
+        if not Path(local).exists():
+            return None
+        return Path(local).read_text(encoding="utf-8")
     jvm = spark.sparkContext._jvm
     hpath = jvm.org.apache.hadoop.fs.Path(path)
     fs = hpath.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
@@ -164,7 +232,13 @@ def _reader(spark: SparkSession, ddl: str):
 
 def read_pos(spark: SparkSession, path: str, ddl: str) -> DataFrame:
     raw = _reader(spark, ddl).option("header", True).csv(path)
-    return raw.select(
+    # A truncated CSV row always loses its last column. Checking it keeps DQ01
+    # exact even where spark.sql.csv.parser.columnPruning.enabled cannot be
+    # turned off (Databricks serverless).
+    last_col = ddl.split(",")[-1].split()[0]
+    corrupt = F.coalesce(F.col("_corrupt_record"),
+                         F.when(F.col(last_col).isNull(), F.lit("TRUNCATED_ROW")))
+    return raw.withColumn("_corrupt_record", corrupt).select(
         F.lit("POS").alias("source_channel"), "source_system",
         "transaction_id", "line_number", "country_code", "city", "store_id",
         "warehouse_id", "customer_id", "loyalty_id", *ITEM_COLS,
@@ -320,10 +394,19 @@ def build_quarantine(tagged: DataFrame, rules: dict[str, dict]) -> DataFrame:
 # --------------------------------------------------------------------------- #
 
 def write_table(df: DataFrame, path: str, fmt: str, partition_by: list[str]) -> None:
-    (df.write.format(fmt).mode("overwrite")
-       .option("overwriteSchema", "true")
-       .partitionBy(*partition_by)
-       .save(path))
+    writer = (df.write.mode("overwrite")
+              .option("overwriteSchema", "true")
+              .partitionBy(*partition_by))
+    if _TABLES:  # managed table (Delta in Unity Catalog on Databricks)
+        writer.format(TABLE_FORMAT or fmt).saveAsTable(table_name(path))
+    else:
+        writer.format(fmt).save(path)
+
+
+def read_table(spark: SparkSession, path: str, fmt: str) -> DataFrame:
+    if _TABLES:
+        return spark.table(table_name(path))
+    return spark.read.format(fmt).load(path)
 
 
 def write_json(spark: SparkSession, path: str, obj: dict) -> None:
@@ -405,7 +488,9 @@ def _print_report(report: dict, timings: dict, counts: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 def run(input_dir: str, dims_dir: str, lake: str, fmt: str = "parquet",
-        master: str | None = None, shuffle_partitions: int = 16) -> dict:
+        master: str | None = None, shuffle_partitions: int = 16,
+        tables: str | None = None) -> dict:
+    configure_tables(tables)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
     spark = build_spark(fmt, master, shuffle_partitions)
     timings: dict[str, float] = {}
@@ -425,13 +510,13 @@ def run(input_dir: str, dims_dir: str, lake: str, fmt: str = "parquet",
 
     # 1) read + normalise, materialised once (also avoids Spark's restriction
     #    on queries that only reference the corrupt-record column)
-    bronze = read_raw(spark, input_dir, contract, run_id).cache()
+    bronze = materialize(read_raw(spark, input_dir, contract, run_id))
     n_bronze = timed("read_normalize", bronze.count)
     timed("write_bronze", lambda: write_table(
         bronze, f"{lake}/bronze/sales_lines", fmt, ["source_channel"]))
 
     # 2) quality rules
-    tagged = apply_quality_rules(bronze, dims).cache()
+    tagged = materialize(apply_quality_rules(bronze, dims))
     timed("validate", tagged.count)
     silver = build_silver(tagged)
     quarantine = build_quarantine(tagged, rules)
@@ -452,13 +537,13 @@ def run(input_dir: str, dims_dir: str, lake: str, fmt: str = "parquet",
 
     summary = {"run_id": run_id, "input": input_dir, "lake": lake, "format": fmt,
                "spark_version": spark.version,
-               "default_parallelism": spark.sparkContext.defaultParallelism,
+               "default_parallelism": default_parallelism(spark),
+               "tables": _TABLES,
                "counts": counts, "timings_s": timings, "dq": report}
     write_json(spark, f"{lake}/_reports/ingest_{run_id}.json", summary)
     _print_report(report, timings, counts)
     print(f"\nReport -> {lake}/_reports/ingest_{run_id}.json")
-    tagged.unpersist()
-    bronze.unpersist()
+    release(tagged, bronze)
     return summary
 
 
@@ -473,12 +558,15 @@ def main() -> None:
     parser.add_argument("--master", default=None,
                         help="e.g. local[4]; leave empty under spark-submit")
     parser.add_argument("--shuffle-partitions", type=int, default=16)
+    parser.add_argument("--tables", default=None,
+                        help="<catalog>.<schema> to write tables instead of paths "
+                             f"(default on Databricks: {DEFAULT_DATABRICKS_TABLES})")
     args = parser.parse_args()
 
     input_dir = args.input.rstrip("/")
     dims_dir = args.dims or input_dir.rsplit("/", 1)[0] + "/dims"
     run(input_dir, dims_dir, args.lake.rstrip("/"), args.format, args.master,
-        args.shuffle_partitions)
+        args.shuffle_partitions, args.tables)
 
 
 if __name__ == "__main__":

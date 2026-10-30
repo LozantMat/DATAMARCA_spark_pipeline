@@ -23,13 +23,23 @@ Usage:
     spark-submit --py-files ingest.py,transform.py pipeline.py \\
         --stages ingest transform --input gs://<bucket>/raw/batch \\
         --dims gs://<bucket>/raw/dims --lake gs://<bucket>/lake
+
+Databricks (serverless job, Python script task in the Git folder): tables are
+written to Unity Catalog as <layer>_<name> in --tables (default
+workspace.datamarca); raw files and reports live in Volumes:
+    pipeline.py --input /Volumes/workspace/datamarca/raw/batch \
+        --dims /Volumes/workspace/datamarca/raw/dims \
+        --lake /Volumes/workspace/datamarca/lake --tables workspace.datamarca
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -57,6 +67,26 @@ def stage_generate(args) -> dict:
     if "://" in args.input:
         raise ValueError("generate writes local files only; upload them to the "
                          "bucket and run --stages ingest transform")
+    # The generator writes temp files and renames them atomically. On
+    # Databricks Volumes, generate on local disk first and then copy.
+    on_volumes = any(p.startswith("/Volumes/") for p in (args.input, args.dims))
+    if on_volumes:
+        tmp = Path(tempfile.mkdtemp(prefix="datamarca_"))
+        final_input, final_dims = Path(args.input), Path(args.dims)
+        if (final_input.exists() and any(final_input.iterdir())
+                and not args.overwrite_generated):
+            raise FileExistsError(
+                f"The generation destination {final_input} is not empty. "
+                "Choose another --input or pass --overwrite-generated to replace it.")
+        local = argparse.Namespace(**{**vars(args), "input": str(tmp / "input"),
+                                      "dims": str(tmp / "dims")})
+        result = stage_generate(local)
+        for src, dst in ((tmp / "input", final_input), (tmp / "dims", final_dims)):
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+        shutil.rmtree(tmp, ignore_errors=True)
+        return result
     # Generation replaces its target directory (clean=True). Do not silently
     # discard a previous dataset unless the caller explicitly allows it.
     target = Path(args.input)
@@ -83,7 +113,7 @@ def stage_generate(args) -> dict:
 def stage_ingest(args) -> dict:
     import ingest
     summary = ingest.run(args.input, args.dims, args.lake, args.format,
-                         args.master, args.shuffle_partitions)
+                         args.master, args.shuffle_partitions, args.tables)
     counts = summary["counts"]
     reject_rate = counts["quarantine_lines"] / max(1, counts["bronze_lines"])
     result = {"run_id": summary["run_id"], **counts,
@@ -102,7 +132,7 @@ def stage_ingest(args) -> dict:
 def stage_transform(args) -> dict:
     import transform
     summary = transform.run(args.lake, args.dims, args.format, args.master,
-                            args.shuffle_partitions)
+                            args.shuffle_partitions, args.tables)
     recon = summary["reconciliation"]
     result = {"run_id": summary["run_id"], "gold_rows": summary["gold_rows"],
               "sales_usd": recon["fact_sales_usd"], "checks": recon["checks"],
@@ -195,7 +225,8 @@ def run(args) -> int:
     try:
         from pyspark.sql import SparkSession
         active = SparkSession.getActiveSession()
-        if active is not None:
+        # never stop the shared Databricks session
+        if active is not None and "DATABRICKS_RUNTIME_VERSION" not in os.environ:
             active.stop()
     except Exception as exc:
         print(f"WARNING: could not stop Spark cleanly: {exc}", file=sys.stderr)
@@ -216,6 +247,9 @@ def parse_args(argv=None):
     p.add_argument("--master", default=None,
                    help="e.g. local[4]; leave empty under spark-submit")
     p.add_argument("--shuffle-partitions", type=int, default=16)
+    p.add_argument("--tables", default=None,
+                   help="<catalog>.<schema>: write Unity Catalog / metastore tables "
+                        "instead of paths (default on Databricks: workspace.datamarca)")
     p.add_argument("--minutes", type=int, default=120, help="generate: simulated minutes")
     p.add_argument("--scale", type=float, default=1.0,
                    help="generate: volume multiplier over 2000 tx/min")

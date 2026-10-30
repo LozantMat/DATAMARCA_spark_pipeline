@@ -32,7 +32,9 @@ from datetime import datetime, timezone
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from ingest import build_spark, write_json, write_table
+from ingest import (ON_DATABRICKS, build_spark, configure_tables, materialize,
+                    release, write_json, write_table)
+from ingest import read_table as _read_table
 
 USD_DECIMALS = 4
 
@@ -42,7 +44,7 @@ USD_DECIMALS = 4
 # --------------------------------------------------------------------------- #
 
 def read_table(spark: SparkSession, path: str, fmt: str) -> DataFrame:
-    return spark.read.format(fmt).load(path)
+    return _read_table(spark, path, fmt)  # path, or table on Databricks
 
 
 def read_dims(spark: SparkSession, dims_dir: str) -> dict[str, DataFrame]:
@@ -208,10 +210,12 @@ def reconcile(silver: DataFrame, fact: DataFrame, gold: dict[str, DataFrame]) ->
 # --------------------------------------------------------------------------- #
 
 def run(lake: str, dims_dir: str, fmt: str = "parquet", master: str | None = None,
-        shuffle_partitions: int = 16) -> dict:
+        shuffle_partitions: int = 16, tables: str | None = None) -> dict:
+    configure_tables(tables)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
     spark = build_spark(fmt, master, shuffle_partitions)
-    spark.sparkContext.setJobGroup("transform", f"datamarca transform {run_id}")
+    if not ON_DATABRICKS:
+        spark.sparkContext.setJobGroup("transform", f"datamarca transform {run_id}")
     timings: dict[str, float] = {}
     t_total = time.perf_counter()
 
@@ -226,14 +230,14 @@ def run(lake: str, dims_dir: str, fmt: str = "parquet", master: str | None = Non
     dims = read_dims(spark, dims_dir)
 
     # 1) enrichment, materialised once and reused by every gold table
-    fact = enrich(silver, dims).withColumnRenamed("is_late", "late_line").cache()
+    fact = materialize(enrich(silver, dims).withColumnRenamed("is_late", "late_line"))
     n_fact = timed("enrich", fact.count)
     timed("write_fact", lambda: write_table(
         fact, f"{lake}/silver/fact_sales_lines", fmt,
         ["country_code", "event_date_local"]))
 
     # 2) gold tables
-    tickets = transactions(fact).cache()
+    tickets = materialize(transactions(fact))
     gold = {
         "daily_sales": daily_sales(fact),
         "hourly_sales": hourly_sales(fact),
@@ -244,7 +248,7 @@ def run(lake: str, dims_dir: str, fmt: str = "parquet", master: str | None = Non
     partitions = {"dq_daily_rejections": ["source_channel"]}
     rows = {}
     for name, df in gold.items():
-        df = df.cache()
+        df = materialize(df)
         gold[name] = df
         rows[name] = timed(f"build_{name}", df.count)
         # gold tables are small: one file per partition avoids "small files"
@@ -267,8 +271,7 @@ def run(lake: str, dims_dir: str, fmt: str = "parquet", master: str | None = Non
     print(f"  fact sales: {recon['fact_sales_usd']:,.2f} USD")
     print("\nTimings (s):", timings)
     print(f"\nReport -> {lake}/_reports/transform_{run_id}.json")
-    for df in [fact, tickets, *gold.values()]:
-        df.unpersist()
+    release(fact, tickets, *gold.values())
     return summary
 
 
@@ -280,9 +283,11 @@ def main() -> None:
     parser.add_argument("--master", default=None,
                         help="e.g. local[4]; leave empty under spark-submit")
     parser.add_argument("--shuffle-partitions", type=int, default=16)
+    parser.add_argument("--tables", default=None,
+                        help="<catalog>.<schema> to read/write tables instead of paths")
     args = parser.parse_args()
     run(args.lake.rstrip("/"), args.dims.rstrip("/"), args.format, args.master,
-        args.shuffle_partitions)
+        args.shuffle_partitions, args.tables)
 
 
 if __name__ == "__main__":

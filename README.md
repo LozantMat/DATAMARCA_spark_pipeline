@@ -186,3 +186,55 @@ Aproximadamente el **2 %** de las transacciones tiene un defecto, para que las v
 | `malformed` | 7 % | La línea del archivo está truncada (CSV con columnas faltantes o JSON inválido). Solo ocurre al escribir archivos. |
 
 Los defectos no se marcan en los datos (el pipeline debe detectarlos por su cuenta); el conteo esperado por ventana está en `_manifest.jsonl`.
+
+---
+
+## 3. Ejecución en Databricks (serverless)
+
+`pipeline.py`, `ingest.py` y `transform.py` detectan Databricks (variable `DATABRICKS_RUNTIME_VERSION`) y se adaptan solos; en local y en Dataproc el comportamiento no cambia. El cómputo serverless de Databricks usa Spark Connect, por lo que:
+
+| Restricción de serverless | Cómo la resuelve el pipeline |
+|---|---|
+| No existe `spark.sparkContext` (ni acceso a la JVM) | Los archivos `_contract.json` / `_truth.jsonl` se leen con Python (los Volumes son rutas locales) |
+| No se permite `cache()` / `unpersist()` | `materialize()` y `release()` no hacen nada en Databricks |
+| Solo se pueden fijar algunas configuraciones de Spark | Se usa la sesión existente y solo se fijan `spark.sql.session.timeZone` y `spark.sql.shuffle.partitions` |
+| No se puede desactivar `spark.sql.csv.parser.columnPruning.enabled` | DQ01 también marca como corrupta toda fila CSV cuya última columna (`schema_version`) llega vacía (una fila truncada siempre la pierde) |
+| Unity Catalog no admite tablas sobre Volumes | Las capas se escriben como tablas Delta administradas `<catálogo>.<esquema>.<capa>_<nombre>` (`--tables`); los reportes JSON van a `<lake>/_reports` |
+
+### 3.1 Preparación (una sola vez)
+
+```sql
+CREATE SCHEMA IF NOT EXISTS workspace.datamarca;
+CREATE VOLUME IF NOT EXISTS workspace.datamarca.raw;
+CREATE VOLUME IF NOT EXISTS workspace.datamarca.lake;
+```
+
+Luego: *Workspace → Create → Git folder* con la URL de este repositorio.
+
+### 3.2 Job
+
+*Jobs & Pipelines → Create job*, una tarea **Python script** (fuente *Workspace*, archivo `pipeline.py` de la Git folder), cómputo **Serverless** y parámetros:
+
+```json
+["--input", "/Volumes/workspace/datamarca/raw/batch",
+ "--dims", "/Volumes/workspace/datamarca/raw/dims",
+ "--lake", "/Volumes/workspace/datamarca/lake",
+ "--tables", "workspace.datamarca",
+ "--overwrite-generated"]
+```
+
+La etapa `generate` genera los datos en disco local y los copia al Volume (el generador renombra archivos de forma atómica). Para reutilizar datos ya generados se agrega `"--stages", "ingest", "transform"`; para pruebas de volumen, `"--scale", "2"` con otro `--input`.
+
+Tablas resultantes en `workspace.datamarca`: `bronze_sales_lines`, `silver_sales_lines`, `quarantine_sales_lines`, `silver_fact_sales_lines`, `gold_daily_sales`, `gold_hourly_sales`, `gold_store_daily_kpis`, `gold_warehouse_daily_demand` y `gold_dq_daily_rejections`.
+
+### 3.3 Evidencia
+
+```sql
+SELECT * FROM workspace.datamarca.gold_daily_sales ORDER BY sales_usd DESC;
+SELECT dq_rule, dq_rule_name, SUM(lines) FROM workspace.datamarca.gold_dq_daily_rejections GROUP BY ALL;
+DESCRIBE HISTORY workspace.datamarca.silver_fact_sales_lines;
+EXPLAIN SELECT SUM(line_total_usd) FROM workspace.datamarca.silver_fact_sales_lines
+WHERE country_code = 'CO';   -- PartitionFilters: partition pruning
+```
+
+El Spark UI no está disponible en serverless; el plan y los tiempos de cada consulta se ven en el *query profile*. Los tiempos por etapa quedan en la salida del job y en `/Volumes/workspace/datamarca/lake/_reports/`.
