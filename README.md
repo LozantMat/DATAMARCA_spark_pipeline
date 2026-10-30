@@ -186,3 +186,219 @@ Aproximadamente el **2 %** de las transacciones tiene un defecto, para que las v
 | `malformed` | 7 % | La línea del archivo está truncada (CSV con columnas faltantes o JSON inválido). Solo ocurre al escribir archivos. |
 
 Los defectos no se marcan en los datos (el pipeline debe detectarlos por su cuenta); el conteo esperado por ventana está en `_manifest.jsonl`.
+
+---
+
+## 3. Guía de replicación en Databricks
+
+### 3.1 Objetivo y resumen
+
+Con esta guía cualquier integrante del equipo puede ejecutar el pipeline de DATAMARCA en Databricks Free Edition en unos 30 minutos, sin instalar nada en su computador. Un solo job serverless genera los datos, los valida, construye las tablas analíticas y exporta los resultados a CSV y a un reporte HTML.
+
+El pipeline tiene cuatro etapas:
+
+1. **generate**: `data_generator.py` crea 2 horas simuladas de transacciones (unas 240 000) de POS (CSV), e-commerce y app de fidelización (JSON), con defectos de calidad inyectados.
+2. **ingest**: lee las tres fuentes, aplica las reglas de calidad DQ01–DQ09 y escribe las capas bronze, silver y quarantine.
+3. **transform**: une silver con las dimensiones, convierte montos a USD y construye las tablas gold.
+4. **export**: `export_results.py` guarda las tablas gold y los reportes de calidad como CSV y genera un reporte HTML para compartir.
+
+**Requisitos previos**
+
+- Una cuenta de [Databricks Free Edition](https://www.databricks.com/learn/free-edition) (gratuita, solo correo).
+- Acceso de lectura al repositorio [LozantMat/DATAMARCA_spark_pipeline](https://github.com/LozantMat/DATAMARCA_spark_pipeline).
+- La rama `feature/databricks-serverless`, mientras no se haya fusionado en `main`.
+
+### 3.2 Arquitectura en Databricks
+
+Todo vive en el esquema `workspace.datamarca`: dos Volumes para archivos y las tablas Delta de cada capa en Unity Catalog.
+
+```mermaid
+flowchart LR
+  subgraph COD[Código]
+    direction TB
+    GH["Repositorio GitHub<br/>rama de trabajo"] -->|pull| GF["Git folder<br/>Workspace Databricks"]
+  end
+  subgraph JOB[Job datamarca-pipeline · Serverless]
+    direction TB
+    G["generate<br/>datos crudos y dimensiones"] --> I["ingest<br/>reglas DQ01–DQ09 y cuarentena"]
+    I --> T["transform<br/>dimensiones, USD y tablas gold"]
+    T --> E["export<br/>CSV, reporte HTML y .zip"]
+  end
+  subgraph ALM[Almacenamiento]
+    direction TB
+    R[("Volume raw<br/>raw/batch y raw/dims")]
+    D[("Tablas Delta<br/>bronze, silver, quarantine")]
+    GO[("Tablas gold<br/>5 tablas de negocio")]
+    L[("Volume lake<br/>_reports y exports")]
+  end
+  GF -->|código| JOB
+  G -->|escribe| R
+  I -->|escribe| D
+  T -->|escribe| GO
+  E -->|escribe| L
+  L -->|Download| EQ["Equipo<br/>abre los CSV y el reporte"]
+```
+
+Cada etapa lee lo que escribió la anterior: ingest lee el Volume `raw`, transform lee silver y quarantine, y export lee las tablas gold y los reportes JSON. Las etapas generate, ingest y transform son la tarea `pipeline` (`pipeline.py`); export es una segunda tarea (`export_results.py`) que corre cuando la primera termina bien.
+
+### 3.3 Paso a paso de configuración
+
+La configuración se hace una sola vez y toma unos 15 minutos.
+
+1. **Crear la cuenta.** Regístrese en Databricks Free Edition. El workspace ya trae el catálogo `workspace` y cómputo serverless; no hay que crear clústeres.
+2. **Crear el esquema y los volúmenes.** Abra *SQL Editor* y ejecute:
+
+   ```sql
+   CREATE SCHEMA IF NOT EXISTS workspace.datamarca;
+   CREATE VOLUME IF NOT EXISTS workspace.datamarca.raw;
+   CREATE VOLUME IF NOT EXISTS workspace.datamarca.lake;
+   ```
+
+3. **Conectar el repositorio.** Vaya a *Workspace → Create → Git folder* y pegue `https://github.com/LozantMat/DATAMARCA_spark_pipeline`. Si el repositorio es privado, primero agregue un token de GitHub en *Settings → Linked accounts*.
+4. **Elegir la rama.** En la Git folder, haga clic en el nombre de la rama (arriba), seleccione `feature/databricks-serverless` y haga *Pull*. Cuando la rama se fusione, use `main`.
+5. **Crear el job.** Vaya a *Jobs & Pipelines → Create job* y nómbrelo `datamarca-pipeline`.
+6. **Tarea 1, `pipeline`.** Tipo **Python script**, fuente **Workspace**, archivo `pipeline.py` de la Git folder, cómputo **Serverless**. Parámetros:
+
+   ```json
+   ["--input", "/Volumes/workspace/datamarca/raw/batch",
+    "--dims", "/Volumes/workspace/datamarca/raw/dims",
+    "--lake", "/Volumes/workspace/datamarca/lake",
+    "--tables", "workspace.datamarca",
+    "--overwrite-generated"]
+   ```
+
+7. **Tarea 2, `export`.** Haga clic en *Add task*, tipo **Python script**, archivo `export_results.py`, cómputo **Serverless**, *Depends on* = `pipeline`. Parámetros:
+
+   ```json
+   ["--lake", "/Volumes/workspace/datamarca/lake",
+    "--tables", "workspace.datamarca",
+    "--sep", ";"]
+   ```
+
+| Parámetro | Qué controla |
+| --- | --- |
+| `--input` | Carpeta donde `generate` escribe los datos crudos y de donde `ingest` los lee |
+| `--dims` | Carpeta de las dimensiones (países, tiendas, productos) |
+| `--lake` | Volume donde quedan los reportes JSON (`_reports`) y las exportaciones (`exports`) |
+| `--tables` | Catálogo y esquema donde se crean las tablas Delta |
+| `--overwrite-generated` | Permite regenerar los datos si `raw/batch` ya tiene archivos |
+| `--sep` | Separador de los CSV: `;` para Excel en español, `,` para pandas o Power BI |
+
+No se necesitan variables de entorno ni credenciales: el job usa la identidad de quien lo ejecuta.
+
+### 3.4 Ejecución y verificación
+
+Una corrida completa tomó 376 s en la primera ejecución (30 de octubre de 2026) y todas las reglas de calidad detectaron el 100 % de los defectos inyectados.
+
+1. En el job, haga clic en **Run now**. La corrida termina en verde cuando las dos tareas terminan bien.
+2. Abra la tarea `pipeline`. Al final de la salida debe aparecer `Pipeline SUCCESS` con las tres etapas en `OK`, la tabla de calidad con recall 1.0 y las cuatro verificaciones de reconciliación en `[OK]`.
+3. Confirme que se crearon las 9 tablas:
+
+   ```sql
+   SHOW TABLES IN workspace.datamarca;
+   ```
+
+4. Consultas de evidencia para el informe:
+
+   ```sql
+   SELECT * FROM workspace.datamarca.gold_daily_sales ORDER BY sales_usd DESC;
+   SELECT dq_rule, dq_rule_name, SUM(lines) AS lineas
+   FROM workspace.datamarca.gold_dq_daily_rejections GROUP BY ALL;
+   DESCRIBE HISTORY workspace.datamarca.silver_fact_sales_lines;  -- versiones Delta
+   EXPLAIN SELECT SUM(line_total_usd) FROM workspace.datamarca.silver_fact_sales_lines
+   WHERE country_code = 'CO';  -- PartitionFilters = poda de particiones
+   ```
+
+| Tabla | Capa | Contenido |
+| --- | --- | --- |
+| `bronze_sales_lines` | bronze | Todas las líneas leídas, con metadatos de ingesta |
+| `silver_sales_lines` | silver | Líneas válidas y deduplicadas, particionadas por país y fecha |
+| `quarantine_sales_lines` | quarantine | Líneas rechazadas y la regla que fallaron |
+| `silver_fact_sales_lines` | silver | Hechos unidos a dimensiones, montos en USD y hora local |
+| `gold_daily_sales` | gold | Ventas por país, día local, canal y categoría |
+| `gold_hourly_sales` | gold | Ventas por país, día y hora local, canal |
+| `gold_store_daily_kpis` | gold | Tickets, ventas y ticket promedio por tienda y día |
+| `gold_warehouse_daily_demand` | gold | Demanda por CEDI, día y SKU |
+| `gold_dq_daily_rejections` | gold | Líneas rechazadas por regla, canal y día |
+
+**Tiempos de referencia (volumen 1x, 240 056 transacciones)**
+
+| Etapa | Duración (s) |
+| --- | --- |
+| generate | 154 |
+| ingest | 170 |
+| transform | 51 |
+| Total | 376 |
+
+El paso más lento es el reporte de calidad dentro de ingest (63 s): sin caché, serverless vuelve a leer los archivos crudos para cada verificación. El Spark UI no existe en serverless; el plan y los tiempos de cada consulta se ven en el *query profile*.
+
+### 3.5 Exportar y compartir los resultados
+
+La tarea `export` deja todo en un solo `.zip` que se descarga desde Databricks y se comparte con el equipo. Toma la última ejecución exitosa y escribe en `/Volumes/workspace/datamarca/lake/exports/<run_id>/`:
+
+| Archivo | Contenido |
+| --- | --- |
+| `01_resumen_ejecucion.csv` | Estado, duración por etapa, conteos de líneas, tasa de rechazo y ventas totales |
+| `02_tiempos_por_etapa.csv` | Segundos de cada paso de ingest y transform |
+| `03_calidad_reglas.csv` | DQ01–DQ07: inyectadas, detectadas, recall y precisión |
+| `04_reconciliacion.csv` | Las cuatro verificaciones de la capa gold |
+| `gold_*.csv` | Las cinco tablas gold completas |
+| `reporte_datamarca_<run_id>.html` | Reporte con KPIs, gráficas y tablas; se abre en cualquier navegador |
+| `datamarca_resultados_<run_id>.zip` | Todo lo anterior en un archivo |
+| `LEEME.txt` | Qué contiene cada archivo |
+
+**Cómo descargarlos**
+
+1. Vaya a *Catalog → workspace → datamarca → Volumes → lake → exports* y abra la carpeta del `run_id` más reciente.
+2. Seleccione `datamarca_resultados_<run_id>.zip` y haga clic en **Download**.
+3. Suba el `.zip` a la carpeta compartida del equipo. El HTML funciona sin conexión y sin Databricks.
+
+**Notas para el análisis**
+
+- Los CSV están en UTF-8 con BOM, así que las tildes se ven bien en Excel.
+- Con `--sep ";"` Excel en español separa las columnas solo; para pandas o Power BI use `--sep ","`.
+- Los montos `*_usd` están en dólares; los `*_local`, en la moneda de cada país (COP, MXN, PEN).
+- Para exportar una ejecución anterior, agregue `"--run-id", "<run_id>"` a los parámetros de la tarea.
+- También se puede correr fuera de Databricks: `python export_results.py --lake lake`.
+
+### 3.6 Adaptaciones para serverless y problemas comunes
+
+El mismo código corre en local, en Dataproc y en Databricks: detecta Databricks por la variable `DATABRICKS_RUNTIME_VERSION` y solo ahí cambia de comportamiento.
+
+| Restricción de serverless | Cómo la resuelve el código |
+| --- | --- |
+| No existe `spark.sparkContext` ni acceso a la JVM | `_contract.json` y `_truth.jsonl` se leen con Python; los Volumes son rutas locales |
+| No se permite `cache()` | `materialize()` y `release()` no hacen nada en Databricks; por eso algunos pasos se recalculan |
+| Solo se pueden fijar algunas configuraciones de Spark | Se usa la sesión existente y solo se fijan la zona horaria (UTC) y las particiones de shuffle |
+| No se puede desactivar `spark.sql.csv.parser.columnPruning.enabled` | DQ01 también marca como corrupta toda fila CSV con `schema_version` vacío: una fila truncada siempre pierde su última columna |
+| Unity Catalog no crea tablas sobre Volumes | Las capas se guardan como tablas Delta `<capa>_<nombre>`; los reportes JSON y los CSV van al Volume `lake` |
+| `sys.exit(0)` marca la tarea como fallida | El script solo llama a `sys.exit` cuando algo falló |
+
+| Síntoma | Causa | Solución |
+| --- | --- | --- |
+| `TABLE_OR_VIEW_NOT_FOUND` al consultar `gold_*` | El job no ha terminado, falló o usó otra rama | Revise la última corrida en *Runs*; confirme la rama de la Git folder y vuelva a correr |
+| `unrecognized arguments: --tables` | La Git folder está en `main` sin la adaptación | Cambie a `feature/databricks-serverless` y haga *Pull* |
+| No aparece la carpeta `exports` ni el `.zip` | La tarea `export` no se agregó, no ha corrido o falló | Revise la salida de la tarea `export`; debe terminar con la lista de archivos. `LIST '/Volumes/workspace/datamarca/lake/exports'` muestra lo que existe |
+| `The generation destination ... is not empty` | `raw/batch` ya tiene datos | Agregue `--overwrite-generated`, o use `--stages ingest transform` para reutilizarlos |
+| La corrida dice *Workload failed* pero la salida termina en `Pipeline SUCCESS` | Versión anterior con `sys.exit(0)` | Haga *Pull* de la rama (commit `fix(pipeline)`) |
+| `GATE_FAILED: quarantine rate ...` | Más del 5 % de las líneas fue rechazado | Revise los datos de entrada o ajuste `--max-reject-rate` |
+| El cómputo se apaga por el resto del día | Se superó la cuota de uso justo de Free Edition | Espere al día siguiente; los datos no se borran |
+
+### 3.7 Pruebas de volumen y costo
+
+Para medir cómo crece el tiempo con el volumen, repita la corrida con 2x y 4x los datos usando *Run now with different parameters* en la tarea `pipeline`.
+
+1. Agregue `"--scale", "2"` y cambie `--input` a `/Volumes/workspace/datamarca/raw/batch_x2`. Repita con `"--scale", "4"` y `batch_x4`.
+2. Cada corrida reescribe las tablas y deja su propio reporte en `lake/_reports`, así que las tres mediciones se conservan.
+3. Exporte cada una con la tarea `export` y `"--run-id", "<run_id>"`; los tiempos quedan en `02_tiempos_por_etapa.csv`.
+4. Registre los resultados:
+
+| Volumen | Transacciones | ingest (s) | transform (s) | Total (s) |
+| --- | --- | --- | --- | --- |
+| 1x | 240 056 | 170 | 51 | 376 |
+| 2x |  |  |  |  |
+| 4x |  |  |  |  |
+
+**Costo:** Free Edition no cobra, así que el costo del informe es una estimación. Multiplique la duración de cada corrida por la tarifa de *Jobs Serverless* que publica Databricks en su [página de precios](https://www.databricks.com/product/pricing) para la nube que se elija, y compárelo con la estimación de Dataproc Serverless que calcula `benchmark.py`.
+
+Haga las pruebas de volumen con tiempo: si se supera la cuota diaria de Free Edition, el cómputo se detiene hasta el día siguiente.
