@@ -238,3 +238,15 @@ WHERE country_code = 'CO';   -- PartitionFilters: partition pruning
 ```
 
 El Spark UI no está disponible en serverless; el plan y los tiempos de cada consulta se ven en el *query profile*. Los tiempos por etapa quedan en la salida del job y en `/Volumes/workspace/datamarca/lake/_reports/`.
+
+### 3.4 Exportar resultados para el equipo
+
+`export_results.py` toma la última ejecución exitosa (según `<lake>/_reports`) y escribe en `<lake>/exports/<run_id>/` los CSV de resumen, tiempos, calidad (DQ01–DQ07), reconciliación y las cinco tablas gold, más un reporte HTML autocontenido y un `.zip` con todo. En Databricks se agrega como segunda tarea del job (*depends on* la tarea del pipeline), también de tipo **Python script** sobre cómputo **Serverless**:
+
+```json
+["--lake", "/Volumes/workspace/datamarca/lake",
+ "--tables", "workspace.datamarca",
+ "--sep", ";"]
+```
+
+`--sep ";"` hace que Excel en español abra los CSV en columnas; con `","` quedan listos para pandas o Power BI. Para exportar una ejecución anterior se agrega `"--run-id", "<run_id>"`. Los archivos se descargan desde *Catalog → workspace → datamarca → lake → exports*. En local: `python export_results.py --lake lake`.
