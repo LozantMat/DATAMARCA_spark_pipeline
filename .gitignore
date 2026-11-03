@@ -15,3 +15,9 @@ derby.log
 checkpoints/
 
 .DS_Store
+
+# Airflow (local orchestration)
+airflow/.env
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/config/airflow.cfg
