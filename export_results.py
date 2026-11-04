@@ -57,28 +57,60 @@ def _local(path: str) -> Path:
 
 
 def load_reports(lake: str, run_id: str | None) -> dict:
+    """Latest ingest + transform reports.
+
+    Works when the stages run in ONE pipeline.py call (local, Databricks
+    job) and when an orchestrator (Airflow) runs each stage separately:
+    each stage writes its own ingest_<id>.json / transform_<id>.json, so
+    they are found independently instead of through a single pipeline_*.json.
+    """
     reports = _local(lake) / "_reports"
-    if run_id:
-        candidates = [reports / f"pipeline_{run_id}.json"]
-    else:
-        candidates = sorted(reports.glob("pipeline_*.json"), reverse=True)
-    for path in candidates:
-        if not path.exists():
-            continue
-        run = json.loads(path.read_text(encoding="utf-8"))
-        if run_id or run.get("status") == "SUCCESS":
+
+    def read(path: Path) -> dict:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def latest(prefix: str) -> dict:
+        files = sorted(reports.glob(f"{prefix}_*.json"), reverse=True)  # ids sort by time
+        return read(files[0]) if files else {}
+
+    if run_id:  # an explicit pipeline run: use the stage reports it points to
+        run = read(reports / f"pipeline_{run_id}.json")
+        def stage(s):
+            sid = run["stages"].get(s, {}).get("run_id")
+            p = reports / f"{s}_{sid}.json"
+            return read(p) if sid and p.exists() else {}
+        return {"pipeline": run, "ingest": stage("ingest"), "transform": stage("transform")}
+
+    ing, tr = latest("ingest"), latest("transform")
+    if not ing or not tr:
+        raise FileNotFoundError(f"no ingest/transform reports in {reports}")
+    # generation stats come from the latest pipeline report that ran 'generate'
+    gen = {}
+    for p in sorted(reports.glob("pipeline_*.json"), reverse=True):
+        g = read(p)["stages"].get("generate", {})
+        if g.get("status") == "OK":
+            gen = g
             break
-    else:
-        raise FileNotFoundError(f"no successful pipeline report in {reports}")
-
-    def stage_report(stage: str) -> dict:
-        sid = run["stages"].get(stage, {}).get("run_id")
-        p = reports / f"{stage}_{sid}.json"
-        return json.loads(p.read_text(encoding="utf-8")) if sid and p.exists() else {}
-
-    return {"pipeline": run, "ingest": stage_report("ingest"),
-            "transform": stage_report("transform")}
-
+    recon = tr.get("reconciliation", {})
+    counts = ing.get("counts", {})
+    i_s = ing.get("timings_s", {}).get("total")
+    t_s = tr.get("timings_s", {}).get("total")
+    rid = tr["run_id"]
+    run = {
+        "run_id": rid,
+        "status": "SUCCESS" if recon.get("all_ok") else "FAILED",
+        "started_at_utc": f"{rid[0:4]}-{rid[4:6]}-{rid[6:8]}T{rid[9:11]}:{rid[11:13]}:{rid[13:15]}",
+        "duration_s": round(sum(x for x in (gen.get("duration_s"), i_s, t_s) if x), 2),
+        "stages": {
+            "generate": gen or {"status": "SKIPPED"},
+            "ingest": {"status": "OK", "run_id": ing["run_id"], "duration_s": i_s, **counts,
+                       "reject_rate": round(counts.get("quarantine_lines", 0)
+                                            / max(1, counts.get("bronze_lines", 0)), 4)},
+            "transform": {"status": "OK" if recon.get("all_ok") else "FAILED",
+                          "run_id": rid, "duration_s": t_s},
+        },
+    }
+    return {"pipeline": run, "ingest": ing, "transform": tr}
 
 def read_gold(spark, lake: str, fmt: str) -> dict[str, tuple[list[str], list[list]]]:
     out = {}
