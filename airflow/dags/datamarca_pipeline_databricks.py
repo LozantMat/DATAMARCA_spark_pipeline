@@ -73,11 +73,16 @@ def run_stage(task_id: str, params: list[str], timeout_min: int, job: str = PIPE
 
 
 def _webhook(text: str) -> None:
-    url = Variable.get("datamarca_webhook_url", default="")
-    if not url:
+    url = Variable.get("datamarca_webhook_url", default="").strip()
+    if not url.startswith("http"):
+        if url:
+            log.warning("datamarca_webhook_url no es una URL valida; se omite el webhook")
         return
     body = json.dumps({"text": text, "content": text}).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "datamarca-airflow/1.0"})
     urllib.request.urlopen(req, timeout=10)
 
 
